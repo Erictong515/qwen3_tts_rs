@@ -11,7 +11,7 @@
 
 use crate::config::{Qwen3TTSConfig, TalkerCodePredictorConfig, TalkerConfig};
 use crate::error::{Qwen3TTSError, Result};
-use crate::layers::{Linear, RMSNorm, RotaryEmbedding, TransformerLayer};
+use crate::layers::{KvCache, Linear, RMSNorm, RotaryEmbedding, TransformerLayer};
 use crate::vocoder::{load_vocoder_weights, Vocoder, VocoderConfig};
 use std::collections::HashMap;
 use std::path::Path;
@@ -242,6 +242,89 @@ impl CodePredictor {
                     .index_select(0, &code_tensor)
                     .unsqueeze(0); // [1, 1, hidden_size]
                 sequence = Tensor::cat(&[sequence, emb], 1);
+            }
+        }
+
+        codes
+    }
+
+    /// Generate codes 1-15 with KV cache (avoids O(n²) sequence growth).
+    pub fn generate_codes_cached(
+        &self,
+        main_hidden: &Tensor,
+        code_0_embedding: &Tensor,
+        temperature: f64,
+        top_k: i64,
+    ) -> Vec<i64> {
+        let mut codes = Vec::new();
+        let num_layers = self.layers.len();
+        let mut caches: Vec<KvCache> = (0..num_layers).map(|_| KvCache::new()).collect();
+
+        // Prefill: process [main_hidden, code_0_embedding] (2 tokens)
+        let initial_input = Tensor::cat(
+            &[main_hidden.shallow_clone(), code_0_embedding.shallow_clone()],
+            1,
+        );
+
+        // Apply projection if present (1.7B+ models)
+        let projected = if let Some(ref proj) = self.small_to_mtp_projection {
+            proj.forward(&initial_input)
+        } else {
+            initial_input
+        };
+
+        // Run through transformer layers with cache (prefill)
+        let mut hidden = projected;
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            hidden = layer.forward_with_cache(&hidden, &self.rotary_emb, cache);
+        }
+        let mut normed = self.norm.forward(&hidden);
+        let mut last_h = normed.select(1, normed.size()[1] - 1).unsqueeze(0); // [1, H]
+
+        for step in 0..self.lm_heads.len() {
+            let logits = self.lm_heads[step].forward(&last_h).squeeze_dim(0);
+
+            // Sample or argmax
+            let code = if temperature <= 0.0 {
+                logits.argmax(-1, false).int64_value(&[0])
+            } else {
+                let logits = &logits / temperature;
+                let logits = if top_k > 0 {
+                    let vocab_size = logits.size()[logits.dim() - 1];
+                    let k = top_k.min(vocab_size);
+                    let (top_values, _) = logits.topk(k, -1, true, true);
+                    let threshold = top_values.select(-1, k - 1);
+                    let mask = logits.lt_tensor(&threshold.unsqueeze(-1));
+                    logits.masked_fill(&mask, f64::NEG_INFINITY)
+                } else {
+                    logits
+                };
+                let probs = logits.softmax(-1);
+                probs.multinomial(1, true).int64_value(&[0, 0])
+            };
+
+            codes.push(code);
+
+            // Prepare next step (single token through cached transformer)
+            if step + 1 < self.lm_heads.len() && step < self.code_embeddings.len() {
+                let code_tensor = Tensor::from_slice_i64(&[code]).to_device(self.device);
+                let emb = self.code_embeddings[step]
+                    .index_select(0, &code_tensor)
+                    .unsqueeze(0); // [1, 1, hidden_size]
+
+                let projected_emb = if let Some(ref proj) = self.small_to_mtp_projection {
+                    proj.forward(&emb)
+                } else {
+                    emb
+                };
+
+                // Single-token forward through transformer with cache
+                let mut h = projected_emb;
+                for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+                    h = layer.forward_with_cache(&h, &self.rotary_emb, cache);
+                }
+                normed = self.norm.forward(&h);
+                last_h = normed.select(1, 0).unsqueeze(0); // [1, H]
             }
         }
 
@@ -966,6 +1049,117 @@ impl TalkerModel {
 
         all_codes
     }
+
+    /// Run transformer forward with KV cache.
+    /// Returns NORMED hidden states for the new token positions only.
+    fn forward_embeds_with_cache(
+        &self,
+        embeddings: &Tensor,
+        caches: &mut [KvCache],
+    ) -> Tensor {
+        let mut hidden = embeddings.shallow_clone();
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            hidden = layer.forward_with_cache(&hidden, &self.rotary_emb, cache);
+        }
+        self.norm.forward(&hidden)
+    }
+
+    /// Generate codes using KV cache (O(n) memory, O(n) compute per step).
+    pub fn generate_codes_cached(
+        &self,
+        input_embeddings: &Tensor,
+        max_codes: i64,
+        temperature: f64,
+        top_k: i64,
+        eos_code: i64,
+        tts_pad_embed: &Tensor,
+    ) -> Vec<Vec<i64>> {
+        let repetition_penalty = 1.05;
+        let mut all_codes = Vec::new();
+        let mut past_code_0s: Vec<i64> = Vec::new();
+        let num_layers = self.layers.len();
+
+        // Initialize KV caches (one per layer)
+        let mut caches: Vec<KvCache> = (0..num_layers).map(|_| KvCache::new()).collect();
+
+        // === Prefill phase: process full input sequence ===
+        let normed_hidden = self.forward_embeds_with_cache(input_embeddings, &mut caches);
+
+        // Predict first code 0
+        let code_0 = self.predict_code_0(
+            &normed_hidden, temperature, top_k, repetition_penalty, &past_code_0s,
+        );
+        past_code_0s.push(code_0);
+
+        if code_0 == eos_code {
+            eprintln!("  EOS detected at prefill");
+            return all_codes;
+        }
+
+        // Generate codes 1-15 for first frame
+        let seq_len = normed_hidden.size()[1];
+        let main_hidden = normed_hidden.select(1, seq_len - 1).unsqueeze(1);
+        let code_0_tensor = Tensor::from_slice_i64(&[code_0]).to_device(self.device);
+        let mut code_0_embed = self.codec_embedding
+            .index_select(0, &code_0_tensor)
+            .unsqueeze(0);
+
+        let mut predictor_codes = self.code_predictor
+            .generate_codes_cached(&main_hidden, &code_0_embed, temperature, top_k);
+
+        let mut frame_codes = vec![code_0];
+        frame_codes.extend_from_slice(&predictor_codes);
+        all_codes.push(frame_codes);
+
+        // === Generation loop: one token at a time with KV cache ===
+        for step in 1..max_codes {
+            // Build next input embedding (sum of all code embeddings + tts_pad)
+            let mut code_embeds_sum = code_0_embed.shallow_clone();
+            for (i, &code) in predictor_codes.iter().enumerate() {
+                if i < self.code_predictor.code_embeddings.len() {
+                    let ct = Tensor::from_slice_i64(&[code]).to_device(self.device);
+                    let emb = self.code_predictor.code_embeddings[i]
+                        .index_select(0, &ct)
+                        .unsqueeze(0);
+                    code_embeds_sum = &code_embeds_sum + &emb;
+                }
+            }
+            let next_input = &code_embeds_sum + tts_pad_embed; // [1, 1, hidden_size]
+
+            // Forward ONLY the new token through the transformer (KV cache handles history)
+            let normed_hidden = self.forward_embeds_with_cache(&next_input, &mut caches);
+
+            // normed_hidden is [1, 1, hidden_size]
+            let code_0 = self.predict_code_0(
+                &normed_hidden, temperature, top_k, repetition_penalty, &past_code_0s,
+            );
+            past_code_0s.push(code_0);
+
+            if code_0 == eos_code {
+                eprintln!("  EOS detected at step {}", step);
+                break;
+            }
+
+            let main_hidden = normed_hidden.select(1, 0).unsqueeze(1);
+            let code_0_tensor = Tensor::from_slice_i64(&[code_0]).to_device(self.device);
+            code_0_embed = self.codec_embedding
+                .index_select(0, &code_0_tensor)
+                .unsqueeze(0);
+
+            predictor_codes = self.code_predictor
+                .generate_codes_cached(&main_hidden, &code_0_embed, temperature, top_k);
+
+            let mut frame_codes = vec![code_0];
+            frame_codes.extend_from_slice(&predictor_codes);
+            all_codes.push(frame_codes);
+
+            if step % 50 == 0 {
+                eprintln!("  Generated {} code frames (cached)", step + 1);
+            }
+        }
+
+        all_codes
+    }
 }
 
 /// TTS Inference engine.
@@ -1267,7 +1461,7 @@ impl TTSInference {
             "Generating audio codes (temp={}, top_k={}, max={})...",
             temperature, top_k, max_codes
         );
-        let codes = self.talker.generate_codes(
+        let codes = self.talker.generate_codes_cached(
             &input_embeddings,
             max_codes,
             temperature,
@@ -1310,6 +1504,10 @@ impl TTSInference {
             waveform.len(),
             waveform.len() as f64 / sample_rate as f64
         );
+
+        // Clear MLX memory cache to prevent inter-request accumulation
+        #[cfg(feature = "mlx")]
+        crate::backend::mlx::clear_cache();
 
         Ok((waveform, sample_rate))
     }
@@ -1479,7 +1677,7 @@ impl TTSInference {
             "Generating audio codes (temp={}, top_k={}, max={})...",
             temperature, top_k, max_codes
         );
-        let codes = self.talker.generate_codes(
+        let codes = self.talker.generate_codes_cached(
             &input_embeddings,
             max_codes,
             temperature,
@@ -1500,6 +1698,10 @@ impl TTSInference {
             waveform.len(),
             waveform.len() as f64 / sample_rate as f64
         );
+
+        // Clear MLX memory cache to prevent inter-request accumulation
+        #[cfg(feature = "mlx")]
+        crate::backend::mlx::clear_cache();
 
         Ok((waveform, sample_rate))
     }
@@ -1600,7 +1802,7 @@ impl TTSInference {
             "Generating audio codes (temp={}, top_k={}, max={})...",
             temperature, top_k, max_codes
         );
-        let codes = self.talker.generate_codes(
+        let codes = self.talker.generate_codes_cached(
             &input_embeddings,
             max_codes,
             temperature,
@@ -1621,6 +1823,10 @@ impl TTSInference {
             waveform.len(),
             waveform.len() as f64 / sample_rate as f64
         );
+
+        // Clear MLX memory cache to prevent inter-request accumulation
+        #[cfg(feature = "mlx")]
+        crate::backend::mlx::clear_cache();
 
         Ok((waveform, sample_rate))
     }
@@ -1733,7 +1939,7 @@ impl TTSInference {
             "Generating audio codes (temp={}, top_k={}, max={})...",
             temperature, top_k, max_codes
         );
-        let generated_codes = self.talker.generate_codes(
+        let generated_codes = self.talker.generate_codes_cached(
             &input_embeddings,
             max_codes,
             temperature,
@@ -1783,6 +1989,10 @@ impl TTSInference {
             waveform.len(),
             waveform.len() as f64 / sample_rate as f64
         );
+
+        // Clear MLX memory cache to prevent inter-request accumulation
+        #[cfg(feature = "mlx")]
+        crate::backend::mlx::clear_cache();
 
         Ok((waveform, sample_rate))
     }

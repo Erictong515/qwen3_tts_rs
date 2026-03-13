@@ -77,3 +77,13 @@ pub fn synchronize() {
     let stream = default_stream();
     unsafe { ffi::mlx_synchronize(stream) };
 }
+
+/// Clear the MLX Metal memory cache.
+///
+/// Call this after completing a generation to release GPU memory buffers
+/// back to the OS. Without this, MLX retains allocated Metal buffers in
+/// its internal cache for reuse, which can accumulate over multiple
+/// generation calls and cause OOM.
+pub fn clear_cache() {
+    unsafe { ffi::mlx_clear_cache() };
+}

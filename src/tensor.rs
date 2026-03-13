@@ -1287,6 +1287,11 @@ impl Tensor {
         Device::Gpu(0)
     }
 
+    /// Create a shallow clone (reference-counted, O(1)).
+    ///
+    /// On the MLX backend, arrays are reference-counted internally.
+    /// `clone()` calls `mlx_array_set` which increments the ref count
+    /// without copying data. This is cheap and correct.
     pub fn shallow_clone(&self) -> Self {
         self.clone()
     }

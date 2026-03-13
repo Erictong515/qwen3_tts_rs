@@ -13,6 +13,36 @@ use tch::nn;
 #[cfg(feature = "mlx")]
 use crate::backend::mlx;
 
+/// Per-layer KV cache for autoregressive inference.
+///
+/// During the prefill phase (first forward pass), K and V are computed for
+/// the full input and stored. During subsequent generation steps, only the
+/// new token's K and V are computed and concatenated to the cache.
+pub struct KvCache {
+    /// Cached key states: [batch, num_kv_heads, cached_len, head_dim]
+    pub key: Option<Tensor>,
+    /// Cached value states: [batch, num_kv_heads, cached_len, head_dim]
+    pub value: Option<Tensor>,
+}
+
+impl KvCache {
+    /// Create an empty cache.
+    pub fn new() -> Self {
+        Self { key: None, value: None }
+    }
+
+    /// Current cached sequence length (0 if empty).
+    pub fn seq_len(&self) -> i64 {
+        self.key.as_ref().map_or(0, |k| k.size()[2])
+    }
+
+    /// Reset the cache (for a new generation).
+    pub fn reset(&mut self) {
+        self.key = None;
+        self.value = None;
+    }
+}
+
 /// RMS Normalization layer.
 pub struct RMSNorm {
     weight: Tensor,
@@ -201,6 +231,39 @@ impl RotaryEmbedding {
             let q_embed = self.apply_rope(q, &cos, &sin);
             let k_embed = self.apply_rope(k, &cos, &sin);
 
+            (q_embed, k_embed)
+        }
+    }
+
+    /// Apply rotary embedding with a position offset (for KV cache generation).
+    ///
+    /// `new_seq_len`: number of new tokens being processed.
+    /// `offset`: position index of the first new token (= length of cached sequence).
+    #[allow(unused_variables)]
+    pub fn forward_with_offset(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        new_seq_len: i64,
+        offset: i64,
+    ) -> (Tensor, Tensor) {
+        #[cfg(feature = "mlx")]
+        {
+            let base = mlx::array::MlxArray::scalar_f32(self._theta as f32);
+            let q_rope = Tensor::from_mlx(mlx::ops::fast_rope(
+                q.as_mlx(), self.dim as i32, false, Some(&base), 1.0, offset as i32,
+            ));
+            let k_rope = Tensor::from_mlx(mlx::ops::fast_rope(
+                k.as_mlx(), self.dim as i32, false, Some(&base), 1.0, offset as i32,
+            ));
+            return (q_rope, k_rope);
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            let cos = self.cos_cache.narrow(0, offset, new_seq_len);
+            let sin = self.sin_cache.narrow(0, offset, new_seq_len);
+            let q_embed = self.apply_rope(q, &cos, &sin);
+            let k_embed = self.apply_rope(k, &cos, &sin);
             (q_embed, k_embed)
         }
     }
@@ -468,6 +531,131 @@ impl Attention {
             seq_len,
             self.num_heads * self.head_dim,
         ]);
+
+        // Output projection
+        self.o_proj.forward(&attn_output)
+    }
+
+    /// Forward pass with KV cache for autoregressive generation.
+    ///
+    /// During prefill (cache is empty), processes the full sequence and populates the cache.
+    /// During generation (cache has content), processes only new token(s) and extends the cache.
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        rotary_emb: &RotaryEmbedding,
+        cache: &mut KvCache,
+    ) -> Tensor {
+        let size = hidden_states.size();
+        let batch_size = size[0];
+        let new_seq_len = size[1];
+
+        // Project Q, K, V for new tokens only
+        let query = self.q_proj.forward(hidden_states);
+        let new_key = self.k_proj.forward(hidden_states);
+        let new_value = self.v_proj.forward(hidden_states);
+
+        // Reshape to (batch, heads, new_seq_len, head_dim)
+        let query = query.view(&[batch_size, new_seq_len, self.num_heads, self.head_dim]).transpose(1, 2);
+        let new_key = new_key.view(&[batch_size, new_seq_len, self.num_kv_heads, self.head_dim]).transpose(1, 2);
+        let new_value = new_value.view(&[batch_size, new_seq_len, self.num_kv_heads, self.head_dim]).transpose(1, 2);
+
+        // Apply Q/K normalization (same logic as forward)
+        let query = if let Some(ref q_norm) = self.q_norm {
+            let eps = 1e-6;
+            let variance = query.pow_scalar(2.0).mean_dim(&[-1], true);
+            let rms = (variance + eps).sqrt().clamp_min(1e-8);
+            let normalized = query / rms;
+            let q_norm_shape = q_norm.size();
+            if q_norm_shape.len() == 1 && q_norm_shape[0] == self.num_heads * self.head_dim {
+                normalized * q_norm.view(&[1, self.num_heads, 1, self.head_dim])
+            } else if q_norm_shape.len() == 1 && q_norm_shape[0] == self.head_dim {
+                normalized * q_norm
+            } else {
+                normalized
+            }
+        } else {
+            query
+        };
+        let new_key = if let Some(ref k_norm) = self.k_norm {
+            let eps = 1e-6;
+            let variance = new_key.pow_scalar(2.0).mean_dim(&[-1], true);
+            let rms = (variance + eps).sqrt().clamp_min(1e-8);
+            let normalized = new_key / rms;
+            let k_norm_shape = k_norm.size();
+            if k_norm_shape.len() == 1 && k_norm_shape[0] == self.num_kv_heads * self.head_dim {
+                normalized * k_norm.view(&[1, self.num_kv_heads, 1, self.head_dim])
+            } else if k_norm_shape.len() == 1 && k_norm_shape[0] == self.head_dim {
+                normalized * k_norm
+            } else {
+                normalized
+            }
+        } else {
+            new_key
+        };
+
+        // Apply rotary embeddings with position offset
+        let position_offset = cache.seq_len();
+        let (query, new_key) = rotary_emb.forward_with_offset(&query, &new_key, new_seq_len, position_offset);
+
+        // Concatenate new K/V with cached K/V
+        let (full_key, full_value) = if let (Some(cached_k), Some(cached_v)) = (&cache.key, &cache.value) {
+            (
+                Tensor::cat(&[cached_k.shallow_clone(), new_key.shallow_clone()], 2),
+                Tensor::cat(&[cached_v.shallow_clone(), new_value.shallow_clone()], 2),
+            )
+        } else {
+            (new_key.shallow_clone(), new_value.shallow_clone())
+        };
+
+        // Update cache
+        cache.key = Some(full_key.shallow_clone());
+        cache.value = Some(full_value.shallow_clone());
+
+        let full_seq_len = full_key.size()[2];
+
+        // Expand KV heads for GQA if needed
+        let (full_key, full_value) = if self.num_kv_heads != self.num_heads {
+            let repeat_factor = self.num_heads / self.num_kv_heads;
+            let key = full_key.unsqueeze(2)
+                .expand(&[batch_size, self.num_kv_heads, repeat_factor, full_seq_len, self.head_dim], false)
+                .reshape(&[batch_size, self.num_heads, full_seq_len, self.head_dim]);
+            let value = full_value.unsqueeze(2)
+                .expand(&[batch_size, self.num_kv_heads, repeat_factor, full_seq_len, self.head_dim], false)
+                .reshape(&[batch_size, self.num_heads, full_seq_len, self.head_dim]);
+            (key, value)
+        } else {
+            (full_key, full_value)
+        };
+
+        // Compute attention (Q attends to full K/V including cache)
+        #[cfg(feature = "mlx")]
+        let attn_output = {
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            // MLX SDPA applies causal mask automatically when query_len < key_len
+            Tensor::from_mlx(mlx::ops::fast_scaled_dot_product_attention(
+                query.as_mlx(), full_key.as_mlx(), full_value.as_mlx(),
+                scale as f32, None,
+            ))
+        };
+        #[cfg(not(feature = "mlx"))]
+        let attn_output = {
+            let scale = (self.head_dim as f64).sqrt();
+            let attn_weights = query.matmul(&full_key.transpose(-2, -1)) / scale;
+            let attn_weights = attn_weights.clamp(-100.0, 100.0);
+            // Build causal mask for new tokens attending to full sequence
+            let positions_start = full_seq_len - new_seq_len;
+            let mask = Tensor::zeros(&[new_seq_len, full_seq_len], DType::Float32, hidden_states.device());
+            let upper = Tensor::ones(&[new_seq_len, full_seq_len], DType::Bool, hidden_states.device());
+            let causal_mask = mask.masked_fill(&upper.triu(positions_start + 1), f64::NEG_INFINITY);
+            let causal_mask = causal_mask.view(&[1, 1, new_seq_len, full_seq_len]);
+            let attn_weights = (attn_weights + causal_mask).softmax(-1);
+            attn_weights.matmul(&full_value)
+        };
+
+        // Reshape back
+        let attn_output = attn_output.transpose(1, 2).contiguous()
+            .view(&[batch_size, new_seq_len, self.num_heads * self.head_dim]);
 
         // Output projection
         self.o_proj.forward(&attn_output)
@@ -782,6 +970,27 @@ impl TransformerLayer {
         residual + hidden
     }
 
+    /// Apply transformer layer with KV cache (attention + MLP with residuals).
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        rotary_emb: &RotaryEmbedding,
+        cache: &mut KvCache,
+    ) -> Tensor {
+        // Self-attention with residual
+        let residual = hidden_states;
+        let hidden = self.input_layernorm.forward(hidden_states);
+        let hidden = self.self_attn.forward_with_cache(&hidden, rotary_emb, cache);
+        let hidden = residual + hidden;
+
+        // MLP with residual
+        let residual = &hidden;
+        let hidden_norm = self.post_attention_layernorm.forward(&hidden);
+        let hidden = self.mlp.forward(&hidden_norm);
+
+        residual + hidden
+    }
+
     /// Forward with debug output (for first layer only)
     #[cfg(feature = "tch-backend")]
     pub fn forward_debug(
@@ -855,12 +1064,56 @@ pub fn conv1d(
 mod tests {
     use super::*;
 
+    /// Initialize MLX backend for tests (CPU mode, safe to call multiple times).
+    #[cfg(feature = "mlx")]
+    fn ensure_mlx_init() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            crate::backend::mlx::stream::init_mlx(false);
+        });
+    }
+
     #[test]
     fn test_snake_activation() {
+        #[cfg(feature = "mlx")]
+        ensure_mlx_init();
         let x = Tensor::from_slice_f32(&[0.0f32, 1.0, 2.0]);
         let alpha = Tensor::from_slice_f32(&[1.0f32, 1.0, 1.0]);
 
         let result = snake_activation(&x, &alpha);
         assert_eq!(result.size(), vec![3]);
+    }
+
+    #[test]
+    fn test_kv_cache_new_is_empty() {
+        let cache = KvCache::new();
+        assert!(cache.key.is_none());
+        assert!(cache.value.is_none());
+        assert_eq!(cache.seq_len(), 0);
+    }
+
+    #[test]
+    fn test_kv_cache_reset() {
+        #[cfg(feature = "mlx")]
+        ensure_mlx_init();
+        let mut cache = KvCache::new();
+        cache.key = Some(Tensor::zeros(&[1, 4, 10, 64], DType::Float32, Device::Cpu));
+        cache.value = Some(Tensor::zeros(&[1, 4, 10, 64], DType::Float32, Device::Cpu));
+        assert_eq!(cache.seq_len(), 10);
+        cache.reset();
+        assert!(cache.key.is_none());
+        assert_eq!(cache.seq_len(), 0);
+    }
+
+    #[test]
+    fn test_kv_cache_seq_len() {
+        #[cfg(feature = "mlx")]
+        ensure_mlx_init();
+        let mut cache = KvCache::new();
+        assert_eq!(cache.seq_len(), 0);
+        cache.key = Some(Tensor::zeros(&[1, 4, 5, 64], DType::Float32, Device::Cpu));
+        cache.value = Some(Tensor::zeros(&[1, 4, 5, 64], DType::Float32, Device::Cpu));
+        assert_eq!(cache.seq_len(), 5);
     }
 }

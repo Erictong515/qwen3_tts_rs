@@ -12,3 +12,5 @@ pub mod stream;
 pub mod ops;
 pub mod io;
 pub mod signal;
+
+pub use stream::clear_cache;

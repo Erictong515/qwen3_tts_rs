@@ -32,9 +32,9 @@ impl Drop for MlxArray {
 }
 
 impl Clone for MlxArray {
+    /// Increment MLX internal reference count (O(1), no data copy).
+    /// `mlx_array_set` copies the handle pointer, not the underlying data.
     fn clone(&self) -> Self {
-        // MLX arrays are reference-counted internally.
-        // Creating a new handle increments the reference count.
         let mut new_ptr = unsafe { ffi::mlx_array_new() };
         unsafe { ffi::mlx_array_set(&mut new_ptr, self.ptr) };
         Self { ptr: new_ptr }
