@@ -632,10 +632,10 @@ impl Attention {
         #[cfg(feature = "mlx")]
         let attn_output = {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
-            // MLX SDPA applies causal mask automatically when query_len < key_len
-            Tensor::from_mlx(mlx::ops::fast_scaled_dot_product_attention(
+            // Use causal mask mode — works for both prefill and generation with KV cache
+            Tensor::from_mlx(mlx::ops::fast_scaled_dot_product_attention_causal(
                 query.as_mlx(), full_key.as_mlx(), full_value.as_mlx(),
-                scale as f32, None,
+                scale as f32,
             ))
         };
         #[cfg(not(feature = "mlx"))]

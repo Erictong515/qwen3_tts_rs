@@ -637,7 +637,42 @@ pub fn fast_scaled_dot_product_attention(
     // mask_mode must be a valid C string (never null!).
     // Valid values: "" (default/auto), "causal", "array".
     // "" with a mask_arr uses the array mask; "" without uses no mask.
-    let mask_mode = b"\0".as_ptr() as *const std::os::raw::c_char;
+    let mask_mode = if mask.is_some() {
+        b"\0".as_ptr() as *const std::os::raw::c_char // "" = use array mask
+    } else {
+        b"\0".as_ptr() as *const std::os::raw::c_char // "" = no mask
+    };
+    let sinks: ffi::mlx_array = std::ptr::null_mut();
+    unsafe {
+        ffi::mlx_fast_scaled_dot_product_attention(
+            &mut res.ptr,
+            queries.ptr,
+            keys.ptr,
+            values.ptr,
+            scale,
+            mask_mode,
+            mask_arr,
+            sinks,
+            default_stream(),
+        );
+    }
+    res
+}
+
+/// Scaled dot-product attention with causal masking.
+///
+/// Uses MLX's built-in causal mask mode — no need to construct an explicit
+/// mask tensor. Works correctly for both prefill (query_len == key_len)
+/// and generation (query_len == 1, key_len > 1) with KV cache.
+pub fn fast_scaled_dot_product_attention_causal(
+    queries: &MlxArray,
+    keys: &MlxArray,
+    values: &MlxArray,
+    scale: f32,
+) -> MlxArray {
+    let mut res = MlxArray::empty();
+    let mask_mode = b"causal\0".as_ptr() as *const std::os::raw::c_char;
+    let mask_arr: ffi::mlx_array = std::ptr::null_mut();
     let sinks: ffi::mlx_array = std::ptr::null_mut();
     unsafe {
         ffi::mlx_fast_scaled_dot_product_attention(
