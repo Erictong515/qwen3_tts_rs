@@ -19,7 +19,8 @@ use qwen3_tts::audio::write_wav_file;
 use qwen3_tts::audio_encoder::AudioEncoder;
 use qwen3_tts::inference::TTSInference;
 use qwen3_tts::speaker_encoder::SpeakerEncoder;
-use qwen3_tts::tensor::Device;
+use qwen3_tts::tensor::{Device, Tensor};
+use std::collections::HashMap;
 use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
@@ -76,11 +77,17 @@ fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
     let inference = TTSInference::new(Path::new(model_path), device)?;
 
-    // Step 2: Load speaker encoder from the same weights
+    // Step 2: Load speaker encoder from model weights file
     println!();
     println!("Loading speaker encoder...");
     let se_config = inference.config().speaker_encoder_config.clone();
-    let speaker_encoder = SpeakerEncoder::load(inference.weights(), &se_config, device)?;
+    let weights_path = Path::new(model_path).join("model.safetensors");
+    let se_weights: HashMap<String, Tensor> = Tensor::load_safetensors(&weights_path)?
+        .into_iter()
+        .map(|(name, tensor)| (name, tensor.to_device(device)))
+        .collect();
+    let speaker_encoder = SpeakerEncoder::load(&se_weights, &se_config, device)?;
+    drop(se_weights);
 
     // Step 3: Load reference audio
     println!();

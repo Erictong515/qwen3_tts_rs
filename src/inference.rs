@@ -69,7 +69,7 @@ impl CodePredictor {
         for i in 0..(num_code_groups - 1) {
             let key = format!("talker.code_predictor.model.codec_embedding.{}.weight", i);
             if let Some(tensor) = weights.get(&key) {
-                code_embeddings.push(tensor.to_device(device).to_dtype(DType::Float32));
+                code_embeddings.push(tensor.to_device(device).to_dtype(DType::Float16));
             }
         }
         eprintln!(
@@ -113,7 +113,7 @@ impl CodePredictor {
             let key = format!("talker.code_predictor.lm_head.{}.weight", i);
             if let Some(tensor) = weights.get(&key) {
                 lm_heads.push(Linear::from_weights(
-                    tensor.to_device(device).to_dtype(DType::Float32),
+                    tensor.to_device(device).to_dtype(DType::Float16),
                 ));
             }
         }
@@ -126,11 +126,11 @@ impl CodePredictor {
             let proj_bias = weights.get("talker.code_predictor.small_to_mtp_projection.bias");
             let proj = if let Some(bias) = proj_bias {
                 Linear::from_weights_with_bias(
-                    proj_weight.to_device(device).to_dtype(DType::Float32),
-                    bias.to_device(device).to_dtype(DType::Float32),
+                    proj_weight.to_device(device).to_dtype(DType::Float16),
+                    bias.to_device(device).to_dtype(DType::Float16),
                 )
             } else {
-                Linear::from_weights(proj_weight.to_device(device).to_dtype(DType::Float32))
+                Linear::from_weights(proj_weight.to_device(device).to_dtype(DType::Float16))
             };
             eprintln!("  Loaded small_to_mtp_projection");
             Some(proj)
@@ -396,7 +396,7 @@ impl TalkerModel {
             .get("talker.model.text_embedding.weight")
             .ok_or_else(|| Qwen3TTSError::ModelLoad("Missing text_embedding.weight".into()))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         eprintln!("  Loaded text_embedding: {:?}", text_embedding.size());
 
         // Load text projection layers (2048 -> 1024)
@@ -406,28 +406,28 @@ impl TalkerModel {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc1.weight".into())
             })?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let text_proj_fc1_bias = weights
             .get("talker.text_projection.linear_fc1.bias")
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc1.bias".into())
             })?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let text_proj_fc2_weight = weights
             .get("talker.text_projection.linear_fc2.weight")
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc2.weight".into())
             })?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let text_proj_fc2_bias = weights
             .get("talker.text_projection.linear_fc2.bias")
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc2.bias".into())
             })?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         eprintln!("  Loaded text_projection layers");
 
         // Load main codec embedding [3072, 1024]
@@ -437,7 +437,7 @@ impl TalkerModel {
                 Qwen3TTSError::ModelLoad("Missing talker.model.codec_embedding.weight".into())
             })?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         eprintln!("  Loaded codec_embedding: {:?}", codec_embedding.size());
 
         // Load transformer layers
@@ -476,7 +476,7 @@ impl TalkerModel {
             .get("talker.codec_head.weight")
             .ok_or_else(|| Qwen3TTSError::ModelLoad("Missing talker.codec_head.weight".into()))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let codec_head = Linear::from_weights(codec_head_weight);
         eprintln!("  Loaded codec_head");
 
@@ -1166,9 +1166,6 @@ impl TalkerModel {
 pub struct TTSInference {
     /// Text tokenizer
     tokenizer: Tokenizer,
-    /// Model weights (kept for reference)
-    #[allow(dead_code)]
-    weights: HashMap<String, Tensor>,
     /// Talker model
     talker: TalkerModel,
     /// Vocoder for decoding audio codes to waveform
@@ -1224,6 +1221,12 @@ impl TTSInference {
         // Load the Talker model
         let talker = TalkerModel::load(&weights, &config.talker_config, device)?;
 
+        // Drop raw weights HashMap — the Talker already owns structured copies.
+        // This frees ~1.7 GB of duplicate Metal GPU buffers.
+        drop(weights);
+        crate::backend::mlx::stream::reclaim_all();
+        eprintln!("Dropped raw weight tensors, reclaimed GPU memory");
+
         // Try to load vocoder
         let vocoder = {
             let vocoder_path = model_path
@@ -1261,7 +1264,6 @@ impl TTSInference {
 
         Ok(Self {
             tokenizer,
-            weights,
             talker,
             vocoder,
             config,
@@ -1725,11 +1727,6 @@ impl TTSInference {
         }
 
         Ok((waveform, sample_rate))
-    }
-
-    /// Get a reference to the loaded model weights.
-    pub fn weights(&self) -> &HashMap<String, Tensor> {
-        &self.weights
     }
 
     /// Get a reference to the model configuration.

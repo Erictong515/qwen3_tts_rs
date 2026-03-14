@@ -126,9 +126,9 @@ impl Linear {
 
     /// Load Linear from pre-loaded weight tensor (no bias).
     pub fn from_weights(weight: Tensor) -> Self {
-        // Convert to float32 for stable computation
+        // Use float16 to halve GPU memory; MLX auto-promotes during matmul
         Self {
-            weight: weight.to_dtype(DType::Float32),
+            weight: weight.to_dtype(DType::Float16),
             bias: None,
         }
     }
@@ -136,8 +136,8 @@ impl Linear {
     /// Load Linear from pre-loaded weight and bias tensors.
     pub fn from_weights_with_bias(weight: Tensor, bias: Tensor) -> Self {
         Self {
-            weight: weight.to_dtype(DType::Float32),
-            bias: Some(bias.to_dtype(DType::Float32)),
+            weight: weight.to_dtype(DType::Float16),
+            bias: Some(bias.to_dtype(DType::Float16)),
         }
     }
 
@@ -344,19 +344,19 @@ impl Attention {
         let q_proj = weights
             .get(&format!("{}.q_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let k_proj = weights
             .get(&format!("{}.k_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let v_proj = weights
             .get(&format!("{}.v_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let o_proj = weights
             .get(&format!("{}.o_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
 
         // Load Q/K norm if present
         let q_norm = weights
@@ -839,15 +839,15 @@ impl MLP {
         let gate_proj = weights
             .get(&format!("{}.gate_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let up_proj = weights
             .get(&format!("{}.up_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
         let down_proj = weights
             .get(&format!("{}.down_proj.weight", prefix))?
             .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_dtype(DType::Float16);
 
         Some(Self {
             gate_proj: Linear::from_weights(gate_proj),
