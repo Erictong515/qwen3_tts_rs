@@ -86,6 +86,25 @@ pub fn clear_cache() {
     unsafe { ffi::mlx_clear_cache() };
 }
 
+/// Aggressively reclaim ALL unreferenced Metal memory.
+///
+/// Temporarily sets the cache limit to 0, which forces MLX to release every
+/// buffer not held by a live array — including those normally kept in the
+/// reuse pool.  The previous cache limit is restored afterwards so that
+/// subsequent allocations can still benefit from pooling.
+///
+/// Call this after `synchronize()` once all intermediate tensors (KV caches,
+/// vocoder temporaries) have been dropped.
+pub fn reclaim_all() {
+    synchronize();
+    let prev = set_cache_limit(0);
+    clear_cache();
+    // Restore a reasonable cache limit so the next generation can reuse buffers.
+    // Use the previous limit if it was set, otherwise default to 0 (no pooling)
+    // to keep memory tight in long-running processes.
+    set_cache_limit(prev);
+}
+
 /// Set MLX cache limit (in bytes). Returns previous limit.
 ///
 /// Controls how much memory MLX retains in its buffer pool for reuse.

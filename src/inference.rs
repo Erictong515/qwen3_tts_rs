@@ -1505,11 +1505,15 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
+        // Drop intermediate MLX tensors before reclaiming Metal memory.
+        // These were kept alive for the generation loop but are no longer needed.
+        drop(input_embeddings);
+        drop(tts_pad_embed);
+
         // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
         {
-            crate::backend::mlx::stream::synchronize();
-            crate::backend::mlx::clear_cache();
+            crate::backend::mlx::stream::reclaim_all();
             let active = crate::backend::mlx::stream::get_active_memory();
             let cache = crate::backend::mlx::stream::get_cache_memory();
             eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
@@ -1706,11 +1710,14 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
+        // Drop intermediate MLX tensors before reclaiming Metal memory.
+        drop(input_embeddings);
+        drop(tts_pad_embed);
+
         // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
         {
-            crate::backend::mlx::stream::synchronize();
-            crate::backend::mlx::clear_cache();
+            crate::backend::mlx::stream::reclaim_all();
             let active = crate::backend::mlx::stream::get_active_memory();
             let cache = crate::backend::mlx::stream::get_cache_memory();
             eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
@@ -1838,11 +1845,14 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
+        // Drop intermediate MLX tensors before reclaiming Metal memory.
+        drop(input_embeddings);
+        drop(tts_pad_embed);
+
         // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
         {
-            crate::backend::mlx::stream::synchronize();
-            crate::backend::mlx::clear_cache();
+            crate::backend::mlx::stream::reclaim_all();
             let active = crate::backend::mlx::stream::get_active_memory();
             let cache = crate::backend::mlx::stream::get_cache_memory();
             eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
@@ -2011,11 +2021,14 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
+        // Drop intermediate MLX tensors before reclaiming Metal memory.
+        drop(input_embeddings);
+        drop(tts_pad_embed);
+
         // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
         {
-            crate::backend::mlx::stream::synchronize();
-            crate::backend::mlx::clear_cache();
+            crate::backend::mlx::stream::reclaim_all();
             let active = crate::backend::mlx::stream::get_active_memory();
             let cache = crate::backend::mlx::stream::get_cache_memory();
             eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
