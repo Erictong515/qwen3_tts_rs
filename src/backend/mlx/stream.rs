@@ -80,10 +80,46 @@ pub fn synchronize() {
 
 /// Clear the MLX Metal memory cache.
 ///
-/// Call this after completing a generation to release GPU memory buffers
-/// back to the OS. Without this, MLX retains allocated Metal buffers in
-/// its internal cache for reuse, which can accumulate over multiple
-/// generation calls and cause OOM.
+/// Releases buffers not referenced by any live array (inference temporaries).
+/// Model weights are safe — they're still held by struct fields.
 pub fn clear_cache() {
     unsafe { ffi::mlx_clear_cache() };
+}
+
+/// Set MLX cache limit (in bytes). Returns previous limit.
+///
+/// Controls how much memory MLX retains in its buffer pool for reuse.
+/// Set to 0 after synchronize() to force release of all unreferenced buffers.
+/// WARNING: set_cache_limit(0) + clear_cache releases ALL unreferenced buffers
+/// including some that may be lazily evaluated. Always restore the limit after.
+pub fn set_cache_limit(limit: usize) -> usize {
+    let mut prev: usize = 0;
+    unsafe { ffi::mlx_set_cache_limit(&mut prev, limit) };
+    prev
+}
+
+/// Get current active (non-cache) memory in bytes.
+pub fn get_active_memory() -> usize {
+    let mut res: usize = 0;
+    unsafe { ffi::mlx_get_active_memory(&mut res) };
+    res
+}
+
+/// Get current cache memory in bytes.
+pub fn get_cache_memory() -> usize {
+    let mut res: usize = 0;
+    unsafe { ffi::mlx_get_cache_memory(&mut res) };
+    res
+}
+
+/// Get peak memory in bytes.
+pub fn get_peak_memory() -> usize {
+    let mut res: usize = 0;
+    unsafe { ffi::mlx_get_peak_memory(&mut res) };
+    res
+}
+
+/// Reset peak memory counter.
+pub fn reset_peak_memory() {
+    unsafe { ffi::mlx_reset_peak_memory() };
 }

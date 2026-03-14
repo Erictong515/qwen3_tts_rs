@@ -684,10 +684,15 @@ extern "C" {
     pub fn mlx_string_data(s: mlx_string) -> *const c_char;
 
     // -----------------------------------------------------------------------
-    // Memory management
+    // Memory management (signatures must match mlx/c/memory.h exactly)
     // -----------------------------------------------------------------------
 
-    pub fn mlx_get_active_memory() -> usize;
-    pub fn mlx_get_peak_memory() -> usize;
     pub fn mlx_clear_cache() -> c_int;
+    pub fn mlx_get_active_memory(res: *mut usize) -> c_int;
+    pub fn mlx_get_cache_memory(res: *mut usize) -> c_int;
+    pub fn mlx_get_memory_limit(res: *mut usize) -> c_int;
+    pub fn mlx_get_peak_memory(res: *mut usize) -> c_int;
+    pub fn mlx_reset_peak_memory() -> c_int;
+    pub fn mlx_set_cache_limit(res: *mut usize, limit: usize) -> c_int;
+    pub fn mlx_set_memory_limit(res: *mut usize, limit: usize) -> c_int;
 }

@@ -1505,9 +1505,16 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
-        // Clear MLX memory cache to prevent inter-request accumulation
+        // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
-        crate::backend::mlx::clear_cache();
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::clear_cache();
+            let active = crate::backend::mlx::stream::get_active_memory();
+            let cache = crate::backend::mlx::stream::get_cache_memory();
+            eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
+                active as f64 / 1_048_576.0, cache as f64 / 1_048_576.0);
+        }
 
         Ok((waveform, sample_rate))
     }
@@ -1699,9 +1706,16 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
-        // Clear MLX memory cache to prevent inter-request accumulation
+        // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
-        crate::backend::mlx::clear_cache();
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::clear_cache();
+            let active = crate::backend::mlx::stream::get_active_memory();
+            let cache = crate::backend::mlx::stream::get_cache_memory();
+            eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
+                active as f64 / 1_048_576.0, cache as f64 / 1_048_576.0);
+        }
 
         Ok((waveform, sample_rate))
     }
@@ -1824,9 +1838,16 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
-        // Clear MLX memory cache to prevent inter-request accumulation
+        // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
-        crate::backend::mlx::clear_cache();
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::clear_cache();
+            let active = crate::backend::mlx::stream::get_active_memory();
+            let cache = crate::backend::mlx::stream::get_cache_memory();
+            eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
+                active as f64 / 1_048_576.0, cache as f64 / 1_048_576.0);
+        }
 
         Ok((waveform, sample_rate))
     }
@@ -1990,9 +2011,16 @@ impl TTSInference {
             waveform.len() as f64 / sample_rate as f64
         );
 
-        // Clear MLX memory cache to prevent inter-request accumulation
+        // Reclaim MLX Metal memory after generation
         #[cfg(feature = "mlx")]
-        crate::backend::mlx::clear_cache();
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::clear_cache();
+            let active = crate::backend::mlx::stream::get_active_memory();
+            let cache = crate::backend::mlx::stream::get_cache_memory();
+            eprintln!("[MEM] post-generate: active={:.0}MB cache={:.0}MB",
+                active as f64 / 1_048_576.0, cache as f64 / 1_048_576.0);
+        }
 
         Ok((waveform, sample_rate))
     }
